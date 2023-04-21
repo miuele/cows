@@ -1,0 +1,3 @@
+[submodule "src/cogtwa/CANopenLinux"]
+	path = src/cogtwa/CANopenLinux
+	url = git@github.com:miuele/CANopenLinux.git
