@@ -6,6 +6,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "cogtwa_interfaces/srv/od_read_u16.hpp"
+#include "cogtwa_interfaces/srv/sdo_read_u16.hpp"
 
 #include <syslog.h>
 
@@ -30,6 +31,8 @@
 #define CO_ERROR_MSG_MAX_LEN 128
 #endif
 
+using namespace std::chrono_literals;
+
 void log_printf(int priority, const char *format, ...) {
     char buffer[CO_ERROR_MSG_MAX_LEN];
 	std::va_list ap;
@@ -45,7 +48,7 @@ void log_printf(int priority, const char *format, ...) {
         RCLCPP_INFO(logger, "%s", buffer);
     } else if (priority == LOG_WARNING) {
         RCLCPP_WARN(logger, "%s", buffer);
-    } else if (priority == LOG_ERR) {
+    } else if (priority == LOG_ERR || priority == LOG_CRIT) {
         RCLCPP_ERROR(logger, "%s", buffer);
     } else {
         RCLCPP_FATAL(logger, "%s", buffer);
@@ -57,8 +60,12 @@ class COGtwa
 {
 public:
     COGtwa(CO_t *CO, OD_t *OD)
-        : Node("COGtwa")
+        : Node("cogtwa")
     {
+        sdo_callback_group_ =
+            this->create_callback_group(
+                    rclcpp::CallbackGroupType::MutuallyExclusive);
+
         publisher_ =
             this->create_publisher<std_msgs::msg::String>(
                     "od2110_written", 10);
@@ -68,24 +75,56 @@ public:
                     "od_read_u16",
                     [CO, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::ODReadU16::Request> req,
-                        std::shared_ptr<cogtwa_interfaces::srv::ODReadU16::Response> res
+                        std::shared_ptr<cogtwa_interfaces::srv::ODReadU16::Response> resp
                       ) {
-                        OD_entry_t *entry = OD_find(OD, req->index);
-
-                        OD_IO_t io;
-                        OD_getSub(entry, req->sub_index, &io, false);
-
-                        OD_size_t bytes_read;
-                        std::uint16_t value = 0;
-
                         CO_LOCK_OD(CO->CANmodule);
-                        io.read(&io.stream, &value, sizeof value, &bytes_read);
+                        OD_get_u16(OD_find(OD, req->index), req->sub_index, &resp->value, false);
                         CO_UNLOCK_OD(CO->CANmodule);
-
-                        res->value = value;
                     });
+        
+        service_sdo_read_u16_ =
+            this->create_service<cogtwa_interfaces::srv::SDOReadU16>(
+                    "sdo_read_u16",
+                    [CO, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::SDOReadU16::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::SDOReadU16::Response> resp
+                        ) {
+                        CO_SDOclient_t *const sdoc = CO->SDOclient;
 
-        using namespace std::chrono_literals;
+                        if (CO_SDOclient_setup(
+                                    sdoc,
+                                    CO_CAN_ID_SDO_CLI + req->node_id,
+                                    CO_CAN_ID_SDO_SRV + req->node_id,
+                                    req->node_id)
+                            != CO_SDO_RT_ok_communicationEnd)
+                        {
+                            return;
+                        }
+
+                        if (CO_SDOclientUploadInitiate(
+                                sdoc, req->index, req->sub_index, 1000, false)
+                            != CO_SDO_RT_ok_communicationEnd)
+                        {
+                            return;
+                        }
+
+                        CO_SDO_return_t ret;
+                        do {
+                            CO_SDO_abortCode_t abort_code = CO_SDO_AB_NONE;
+
+                            ret = CO_SDOclientUpload(
+                                    sdoc, 10000, false, &abort_code,
+                                    nullptr, nullptr, nullptr);
+                            if (ret < 0) {
+                                return;
+                            }
+                            std::this_thread::sleep_for(10000us);
+                        } while (ret > 0);
+
+                        CO_SDOclientUploadBufRead(sdoc,
+                                reinterpret_cast<unsigned char*>(&resp->value), sizeof(resp->value));
+
+                    }, rmw_qos_profile_services_default, sdo_callback_group_);
 
         timer_ =
             this->create_wall_timer(500ms, [&pub = publisher_]{
@@ -95,14 +134,16 @@ public:
                 });
     }
 private:
+    std::shared_ptr<rclcpp::CallbackGroup> sdo_callback_group_;
+
     std::shared_ptr<
         rclcpp::Publisher<std_msgs::msg::String>> publisher_;
 
     std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::ODReadU16>> service_od_read_u16;
+        rclcpp::Service<cogtwa_interfaces::srv::ODReadU16>> service_od_read_u16_;
 
     std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::SDOReadU16>> service_sdo_read_u16;
+        rclcpp::Service<cogtwa_interfaces::srv::SDOReadU16>> service_sdo_read_u16_;
 
     std::shared_ptr<rclcpp::TimerBase> timer_;
 };
@@ -129,11 +170,14 @@ int main(int argc, char **argv) {
 	}
 
 	CO_epoll_t ep_main;
-	CO_ReturnError_t err = CO_epoll_create(&ep_main, MAIN_THREAD_INTERVAL_US);
-	if (err != CO_ERROR_NO) {
-		log_printf(LOG_CRIT, DBG_GENERAL, "CO_epoll_create(main), err=", err);
-		std::exit(EXIT_FAILURE);
-	}
+    {
+        CO_ReturnError_t err = CO_epoll_create(&ep_main, MAIN_THREAD_INTERVAL_US);
+        if (err != CO_ERROR_NO) {
+            log_printf(LOG_CRIT, DBG_GENERAL, "CO_epoll_create(main), err=", err);
+            std::exit(EXIT_FAILURE);
+        }
+    }
+
     int app_eventfd = eventfd(0, EFD_NONBLOCK);
     struct epoll_event ev{};
     ev.events = EPOLLIN;
@@ -141,6 +185,21 @@ int main(int argc, char **argv) {
     epoll_ctl(ep_main.epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev);
 
 	CANptr.epoll_fd = ep_main.epoll_fd;
+
+    CO_epoll_gtw_t ep_gtw;
+    {
+        static char socket_path[] = "/tmp/CO_command_socket";
+        CO_ReturnError_t err = CO_epoll_createGtw(
+                &ep_gtw,
+                ep_main.epoll_fd,
+                CO_COMMAND_IF_LOCAL_SOCKET,
+                1000,
+                socket_path);
+        if (err != CO_ERROR_NO) {
+            log_printf(LOG_CRIT, DBG_GENERAL, "CO_epoll_createGtw(), err=", err);
+            std::exit(EXIT_FAILURE);
+        }
+    }
 
 	{
 		CO_CANsetConfigurationMode(&CANptr);
@@ -173,7 +232,10 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	CO_CANsetNormalMode(CO->CANmodule);
+
 	CO_epoll_initCANopenMain(&ep_main, CO);
+    CO_epoll_initCANopenGtw(&ep_gtw, CO);
 
 	{
 		std::uint32_t err_info = 0;
@@ -188,37 +250,43 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	CO_CANsetNormalMode(CO->CANmodule);
-
     std::atomic<bool> should_die{false};
 
-    std::future<void> co_fut = std::async(
-                std::launch::async,
-                [&] {
-                    CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
-                    while (reset == CO_RESET_NOT) {
-                        CO_epoll_wait(&ep_main);
-                        if (should_die.load()) {
-                            break;
-                        }
-                        CO_epoll_processRT(&ep_main, CO, false);
-                        CO_epoll_processMain(&ep_main, CO, false, &reset);
-                        CO_epoll_processLast(&ep_main);
-                    }
-                });
+    std::thread co_rtml_thread([&] {
+            CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
+            while (reset == CO_RESET_NOT) {
+                CO_epoll_wait(&ep_main);
+                if (should_die.load()) {
+                    break;
+                }
+                CO_epoll_processRT(&ep_main, CO, false);
+                CO_epoll_processMain(&ep_main, CO, true, &reset);
+                CO_epoll_processGtw(&ep_gtw, CO, &ep_main);
+                CO_epoll_processLast(&ep_main);
+            }
+        });
 
+    auto node = std::make_shared<COGtwa>(CO, OD);
 
-    rclcpp::spin_until_future_complete(std::make_shared<COGtwa>(CO, OD), co_fut);
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node); 
+
+    RCLCPP_INFO(rclcpp::get_logger("cogtwa"), "start spinning...");
+
+    executor.spin();
 
     should_die.store(true);
 
     uint64_t u = 1;
     write(ep_main.event_fd, &u, sizeof u);
 
-    co_fut.wait();
+    co_rtml_thread.join();
 
 	CO_epoll_close(&ep_main);
+    CO_epoll_closeGtw(&ep_gtw);
+
 	CO_CANsetConfigurationMode(&CANptr);
+
 	CO_delete(CO);
 
     rclcpp::shutdown();
