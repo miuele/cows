@@ -11,7 +11,11 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
     "srv/ODReadU16.srv"
+    "srv/ODRead.srv"
+    "srv/ODWrite.srv"
     "srv/SDOReadU16.srv"
+    "srv/SDORead.srv"
+    "srv/SDOWrite.srv"
 )
 
 if(BUILD_TESTING)

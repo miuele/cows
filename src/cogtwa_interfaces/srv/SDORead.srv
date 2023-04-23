@@ -1,0 +1,7 @@
+uint8 node_id
+uint16 index
+uint8 sub_index
+uint32 size
+---
+bool ok
+byte[] value

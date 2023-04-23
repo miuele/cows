@@ -5,8 +5,10 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
-#include "cogtwa_interfaces/srv/od_read_u16.hpp"
-#include "cogtwa_interfaces/srv/sdo_read_u16.hpp"
+#include "cogtwa_interfaces/srv/od_read.hpp"
+#include "cogtwa_interfaces/srv/od_write.hpp"
+#include "cogtwa_interfaces/srv/sdo_read.hpp"
+#include "cogtwa_interfaces/srv/sdo_write.hpp"
 
 #include <syslog.h>
 
@@ -15,6 +17,8 @@
 #include "CO_error.h"
 #include "CO_epoll_interface.h"
 #include "CO_storageLinux.h"
+
+#include "cogtwa/CO_utils.hpp"
 
 #define MAIN_THREAD_INTERVAL_US 100'000
 #define NMT_CONTROL (static_cast<CO_NMT_control_t>( \
@@ -70,60 +74,70 @@ public:
             this->create_publisher<std_msgs::msg::String>(
                     "od2110_written", 10);
 
-        service_od_read_u16_ =
-            this->create_service<cogtwa_interfaces::srv::ODReadU16>(
-                    "od_read_u16",
+        service_od_read_ =
+            this->create_service<cogtwa_interfaces::srv::ODRead>(
+                    "od_read",
                     [CO, OD](
-                        const std::shared_ptr<cogtwa_interfaces::srv::ODReadU16::Request> req,
-                        std::shared_ptr<cogtwa_interfaces::srv::ODReadU16::Response> resp
+                        const std::shared_ptr<cogtwa_interfaces::srv::ODRead::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::ODRead::Response> resp
                       ) {
+                        resp->value.resize(req->size);
+
                         CO_LOCK_OD(CO->CANmodule);
-                        OD_get_u16(OD_find(OD, req->index), req->sub_index, &resp->value, false);
+                        resp->ok = OD_get_value(OD_find(OD, req->index), req->sub_index, resp->value.data(), req->size, false)
+                            == ODR_OK;
                         CO_UNLOCK_OD(CO->CANmodule);
                     });
-        
-        service_sdo_read_u16_ =
-            this->create_service<cogtwa_interfaces::srv::SDOReadU16>(
-                    "sdo_read_u16",
+
+        service_od_write_ =
+            this->create_service<cogtwa_interfaces::srv::ODWrite>(
+                    "od_write",
                     [CO, OD](
-                        const std::shared_ptr<cogtwa_interfaces::srv::SDOReadU16::Request> req,
-                        std::shared_ptr<cogtwa_interfaces::srv::SDOReadU16::Response> resp
+                        const std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Response> resp
+                      ) {
+                        CO_LOCK_OD(CO->CANmodule);
+                        resp->ok = OD_set_value(OD_find(OD, req->index), req->sub_index, req->value.data(), req->value.size(), false)
+                            == ODR_OK;
+                        CO_UNLOCK_OD(CO->CANmodule);
+                    });
+
+        service_sdo_read_ =
+            this->create_service<cogtwa_interfaces::srv::SDORead>(
+                    "sdo_read",
+                    [CO, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::SDORead::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::SDORead::Response> resp
+                        ) {
+                        resp->value.resize(req->size);
+
+                        CO_SDOclient_t *const sdoc = CO->SDOclient;
+                        std::size_t size_read;
+                        resp->ok = read_SDO(
+                                sdoc,
+                                req->node_id,
+                                req->index,
+                                req->sub_index,
+                                resp->value.data(),
+                                req->size,
+                                &size_read) == CO_SDO_AB_NONE;
+                    }, rmw_qos_profile_services_default, sdo_callback_group_);
+
+        service_sdo_write_ =
+            this->create_service<cogtwa_interfaces::srv::SDOWrite>(
+                    "sdo_write",
+                    [CO, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::SDOWrite::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::SDOWrite::Response> resp
                         ) {
                         CO_SDOclient_t *const sdoc = CO->SDOclient;
-
-                        if (CO_SDOclient_setup(
-                                    sdoc,
-                                    CO_CAN_ID_SDO_CLI + req->node_id,
-                                    CO_CAN_ID_SDO_SRV + req->node_id,
-                                    req->node_id)
-                            != CO_SDO_RT_ok_communicationEnd)
-                        {
-                            return;
-                        }
-
-                        if (CO_SDOclientUploadInitiate(
-                                sdoc, req->index, req->sub_index, 1000, false)
-                            != CO_SDO_RT_ok_communicationEnd)
-                        {
-                            return;
-                        }
-
-                        CO_SDO_return_t ret;
-                        do {
-                            CO_SDO_abortCode_t abort_code = CO_SDO_AB_NONE;
-
-                            ret = CO_SDOclientUpload(
-                                    sdoc, 10000, false, &abort_code,
-                                    nullptr, nullptr, nullptr);
-                            if (ret < 0) {
-                                return;
-                            }
-                            std::this_thread::sleep_for(10000us);
-                        } while (ret > 0);
-
-                        CO_SDOclientUploadBufRead(sdoc,
-                                reinterpret_cast<unsigned char*>(&resp->value), sizeof(resp->value));
-
+                        resp->ok = write_SDO(
+                                sdoc,
+                                req->node_id,
+                                req->index,
+                                req->sub_index,
+                                req->value.data(),
+                                req->value.size()) == CO_SDO_AB_NONE;
                     }, rmw_qos_profile_services_default, sdo_callback_group_);
 
         timer_ =
@@ -140,10 +154,16 @@ private:
         rclcpp::Publisher<std_msgs::msg::String>> publisher_;
 
     std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::ODReadU16>> service_od_read_u16_;
+        rclcpp::Service<cogtwa_interfaces::srv::ODRead>> service_od_read_;
 
     std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::SDOReadU16>> service_sdo_read_u16_;
+        rclcpp::Service<cogtwa_interfaces::srv::ODWrite>> service_od_write_;
+
+    std::shared_ptr<
+        rclcpp::Service<cogtwa_interfaces::srv::SDORead>> service_sdo_read_;
+
+    std::shared_ptr<
+        rclcpp::Service<cogtwa_interfaces::srv::SDOWrite>> service_sdo_write_;
 
     std::shared_ptr<rclcpp::TimerBase> timer_;
 };
