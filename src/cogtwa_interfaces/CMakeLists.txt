@@ -16,6 +16,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     "srv/SDOReadU16.srv"
     "srv/SDORead.srv"
     "srv/SDOWrite.srv"
+    "srv/ConfigureODNotify.srv"
+    "msg/NotifyODWrite.msg"
 )
 
 if(BUILD_TESTING)

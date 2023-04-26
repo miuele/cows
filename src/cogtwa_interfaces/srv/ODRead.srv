@@ -3,4 +3,4 @@ uint8 sub_index
 uint32 size
 ---
 bool ok
-byte[] value
+byte[] data

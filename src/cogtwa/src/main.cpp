@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <thread>
+#include <charconv>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -9,11 +10,15 @@
 #include "cogtwa_interfaces/srv/od_write.hpp"
 #include "cogtwa_interfaces/srv/sdo_read.hpp"
 #include "cogtwa_interfaces/srv/sdo_write.hpp"
+#include "cogtwa_interfaces/srv/configure_od_notify.hpp"
+#include "cogtwa_interfaces/msg/notify_od_write.hpp"
 
 #include <syslog.h>
 
 #include "CANopen.h"
+extern "C" {
 #include "OD.h"
+}
 #include "CO_error.h"
 #include "CO_epoll_interface.h"
 #include "CO_storageLinux.h"
@@ -35,7 +40,20 @@
 #define CO_ERROR_MSG_MAX_LEN 128
 #endif
 
+
 using namespace std::chrono_literals;
+using namespace std::string_literals;
+
+std::string notify_od_write_topic_name(std::uint16_t index) {
+    char a[8]{};
+    std::to_chars(std::begin(a), std::end(a), index, 16);
+    return "notify_od_write_0x"s + a;
+}
+
+struct ODEntryHook {
+    std::shared_ptr<rclcpp::Publisher<cogtwa_interfaces::msg::NotifyODWrite>> notify_od_write_publisher;
+    OD_extension_t od_extension{};
+};
 
 void log_printf(int priority, const char *format, ...) {
     char buffer[CO_ERROR_MSG_MAX_LEN];
@@ -81,10 +99,10 @@ public:
                         const std::shared_ptr<cogtwa_interfaces::srv::ODRead::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ODRead::Response> resp
                       ) {
-                        resp->value.resize(req->size);
+                        resp->data.resize(req->size);
 
                         CO_LOCK_OD(CO->CANmodule);
-                        resp->ok = OD_get_value(OD_find(OD, req->index), req->sub_index, resp->value.data(), req->size, false)
+                        resp->ok = OD_get_value(OD_find(OD, req->index), req->sub_index, resp->data.data(), req->size, false)
                             == ODR_OK;
                         CO_UNLOCK_OD(CO->CANmodule);
                     });
@@ -97,7 +115,7 @@ public:
                         std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Response> resp
                       ) {
                         CO_LOCK_OD(CO->CANmodule);
-                        resp->ok = OD_set_value(OD_find(OD, req->index), req->sub_index, req->value.data(), req->value.size(), false)
+                        resp->ok = OD_set_value(OD_find(OD, req->index), req->sub_index, req->data.data(), req->data.size(), false)
                             == ODR_OK;
                         CO_UNLOCK_OD(CO->CANmodule);
                     });
@@ -109,7 +127,7 @@ public:
                         const std::shared_ptr<cogtwa_interfaces::srv::SDORead::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::SDORead::Response> resp
                         ) {
-                        resp->value.resize(req->size);
+                        resp->data.resize(req->size);
 
                         CO_SDOclient_t *const sdoc = CO->SDOclient;
                         std::size_t size_read;
@@ -118,7 +136,7 @@ public:
                                 req->node_id,
                                 req->index,
                                 req->sub_index,
-                                resp->value.data(),
+                                resp->data.data(),
                                 req->size,
                                 &size_read) == CO_SDO_AB_NONE;
                     }, rmw_qos_profile_services_default, sdo_callback_group_);
@@ -136,9 +154,34 @@ public:
                                 req->node_id,
                                 req->index,
                                 req->sub_index,
-                                req->value.data(),
-                                req->value.size()) == CO_SDO_AB_NONE;
+                                req->data.data(),
+                                req->data.size()) == CO_SDO_AB_NONE;
                     }, rmw_qos_profile_services_default, sdo_callback_group_);
+
+        service_configure_od_notify_ =
+            this->create_service<cogtwa_interfaces::srv::ConfigureODNotify>(
+                    "configure_od_notify",
+                    [this, CO, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Response> resp
+                        ) {
+                        
+                        auto topic_name = notify_od_write_topic_name(req->index);
+                        auto it = od_hooks_.try_emplace(topic_name, std::make_unique<ODEntryHook>()).first;
+                        it->second->notify_od_write_publisher = this->create_publisher<cogtwa_interfaces::msg::NotifyODWrite>(topic_name, 10);
+                        it->second->od_extension.object = &*it->second;
+                        it->second->od_extension.read = OD_readOriginal;
+                        it->second->od_extension.write = [](OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written) {
+                                cogtwa_interfaces::msg::NotifyODWrite msg;
+                                msg.sub_index = stream->subIndex;
+                                msg.data.resize(size);
+                                std::memcpy(msg.data.data(), buf, size);
+                                static_cast<ODEntryHook *>(stream->object)->notify_od_write_publisher->publish(std::move(msg));
+                                return OD_writeOriginal(stream, buf, size, size_written);
+                            };
+                        OD_extension_init(OD_find(OD, req->index), &it->second->od_extension);
+                        resp->topic_name = topic_name;
+                    });
 
         timer_ =
             this->create_wall_timer(500ms, [&pub = publisher_]{
@@ -164,6 +207,11 @@ private:
 
     std::shared_ptr<
         rclcpp::Service<cogtwa_interfaces::srv::SDOWrite>> service_sdo_write_;
+
+    std::shared_ptr<
+        rclcpp::Service<cogtwa_interfaces::srv::ConfigureODNotify>> service_configure_od_notify_;
+
+    std::unordered_map<std::string, std::unique_ptr<ODEntryHook>> od_hooks_;
 
     std::shared_ptr<rclcpp::TimerBase> timer_;
 };
@@ -311,4 +359,3 @@ int main(int argc, char **argv) {
 
     rclcpp::shutdown();
 }
-

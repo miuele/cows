@@ -1,6 +1,6 @@
 uint8 node_id
 uint16 index
 uint8 sub_index
-byte[] value
+byte[] data
 ---
 bool ok
