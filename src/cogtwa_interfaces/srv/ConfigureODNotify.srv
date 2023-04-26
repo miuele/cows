@@ -1,4 +1,4 @@
 uint16 index
-bool write
+bool on_write
 ---
 string topic_name
