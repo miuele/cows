@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(cogtwa_interfaces REQUIRED)
+find_package(Boost REQUIRED COMPONENTS thread)
 
 add_executable(cogtwa src/main.cpp src/OD.c)
 target_compile_features(cogtwa PRIVATE cxx_std_17)
@@ -19,6 +20,8 @@ ament_target_dependencies(cogtwa rclcpp std_msgs cogtwa_interfaces)
 add_subdirectory(CANopenLinux)
 target_include_directories(CANopenLinux PRIVATE include)
 target_link_libraries(cogtwa CANopenLinux)
+
+target_link_libraries(cogtwa Boost::thread)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
