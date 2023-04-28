@@ -19,6 +19,7 @@ ament_target_dependencies(cogtwa rclcpp std_msgs cogtwa_interfaces)
 
 add_subdirectory(CANopenLinux)
 target_include_directories(CANopenLinux PRIVATE include)
+target_compile_definitions(CANopenLinux PUBLIC CO_DRIVER_CUSTOM)
 target_link_libraries(cogtwa CANopenLinux)
 
 target_link_libraries(cogtwa Boost::thread)
