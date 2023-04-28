@@ -26,6 +26,7 @@ extern "C" {
 #include "CO_storageLinux.h"
 
 #include "cogtwa/CO_utils.hpp"
+#include "cogtwa/OD_Extension.hpp"
 #include "cogtwa/assoc_arena.hpp"
 
 #define MAIN_THREAD_INTERVAL_US 100'000
@@ -42,8 +43,6 @@ extern "C" {
 #ifndef CO_ERROR_MSG_MAX_LEN
 #define CO_ERROR_MSG_MAX_LEN 128
 #endif
-
-using assoc_arena::AssociativeArena;
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
@@ -76,6 +75,8 @@ void log_printf(int priority, const char *format, ...) {
     }
 }
 
+std::mutex co_global_mutex;
+
 class COGtwa
     : public rclcpp::Node
 {
@@ -97,49 +98,10 @@ private:
         std::vector<std::uint8_t> data;
     };
 
-    struct ODEntryHook {
-        ODEntryHook(ODEntryHook &&other)
-            : enabled(other.enabled.load())
-              , index(other.index)
-              , queue(other.queue)
-              , od_extension(std::move(other.od_extension))
-              , node(other.node)
-              , mutex(std::move(other.mutex))
-        {
-        }
-
-        ODEntryHook(COGtwa *nod, std::uint16_t ind)
-            : enabled(false), index(ind), queue(nullptr), od_extension{}, node(nod)
-        {
-        }
-
-        std::atomic<bool> enabled;
-        std::uint16_t index;
-        boost::sync_queue<ODWriteNotifyData> *queue;
-        OD_extension_t od_extension;
-        COGtwa *node;
-
-        std::unique_ptr<std::mutex> mutex;
-    };
 public:
     COGtwa(CO_t *CO, OD_t *OD)
-        : Node("cogtwa"), arena_(128)
+        : Node("cogtwa"), od_extension_(OD)
     {
-        std::vector<std::uint16_t> user_od_indices;
-        for (OD_entry_t *entry = OD_find(OD, 0x2000); entry < (OD->list + OD->size); ++entry) {
-            std::uint16_t index = OD_getIndex(entry);
-            if (index > 0x2FFF) {
-                break;
-            }
-            user_od_indices.push_back(index);
-        }
-
-        for (std::uint16_t index : user_od_indices) {
-            ODEntryHook *hook = arena_.emplace(index, this, index);
-            hook->od_extension.object = hook;
-            hook->od_extension.write = &COGtwa::od_write;
-            OD_extension_init(OD_find(OD, index), &hook->od_extension);
-        }
 
         sdo_callback_group_ =
             this->create_callback_group(
@@ -148,73 +110,75 @@ public:
         service_od_read_ =
             this->create_service<cogtwa_interfaces::srv::ODRead>(
                     "od_read",
-                    [CO, OD](
+                    [can_module = CO->CANmodule, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::ODRead::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ODRead::Response> resp
                       ) {
                         resp->data.resize(req->size);
 
-                        CO_LOCK_OD(CO->CANmodule);
+                        ScopedODLock lock(can_module);
                         resp->ok = OD_get_value(OD_find(OD, req->index), req->sub_index, resp->data.data(), req->size, false)
                             == ODR_OK;
-                        CO_UNLOCK_OD(CO->CANmodule);
                     });
 
         service_od_write_ =
             this->create_service<cogtwa_interfaces::srv::ODWrite>(
                     "od_write",
-                    [CO, OD](
+                    [can_module = CO->CANmodule, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Response> resp
                       ) {
-                        CO_LOCK_OD(CO->CANmodule);
+                        ScopedODLock lock(can_module);
                         resp->ok = OD_set_value(OD_find(OD, req->index), req->sub_index, req->data.data(), req->data.size(), false)
                             == ODR_OK;
-                        CO_UNLOCK_OD(CO->CANmodule);
                     });
 
         service_sdo_read_ =
             this->create_service<cogtwa_interfaces::srv::SDORead>(
                     "sdo_read",
-                    [CO, OD](
+                    [sdoc = CO->SDOclient, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::SDORead::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::SDORead::Response> resp
                         ) {
-                        resp->data.resize(req->size);
 
-                        CO_SDOclient_t *const sdoc = CO->SDOclient;
+                        resp->data.resize(req->size);
                         std::size_t size_read;
-                        resp->ok = read_SDO(
+
+                        resp->ok = read_SDO_blocking(
                                 sdoc,
+                                co_global_mutex,
                                 req->node_id,
                                 req->index,
                                 req->sub_index,
                                 resp->data.data(),
                                 req->size,
                                 &size_read) == CO_SDO_AB_NONE;
+
                     }, rmw_qos_profile_services_default, sdo_callback_group_);
 
         service_sdo_write_ =
             this->create_service<cogtwa_interfaces::srv::SDOWrite>(
                     "sdo_write",
-                    [CO, OD](
+                    [sdoc = CO->SDOclient, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::SDOWrite::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::SDOWrite::Response> resp
                         ) {
-                        CO_SDOclient_t *const sdoc = CO->SDOclient;
-                        resp->ok = write_SDO(
+
+                        resp->ok = write_SDO_blocking(
                                 sdoc,
+                                co_global_mutex,
                                 req->node_id,
                                 req->index,
                                 req->sub_index,
                                 req->data.data(),
                                 req->data.size()) == CO_SDO_AB_NONE;
+
                     }, rmw_qos_profile_services_default, sdo_callback_group_);
 
         service_configure_od_notify_ =
             this->create_service<cogtwa_interfaces::srv::ConfigureODNotify>(
                     "configure_od_notify",
-                    [this, CO, OD](
+                    [this, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Response> resp
                         ) {
@@ -222,15 +186,23 @@ public:
                         auto index = req->index;
                         auto topic_name = od_write_notify_topic_name(index);
 
-                        ODEntryHook *hook = arena_.get(index);
-                        if (!hook->enabled) {
-                            hook->mutex = std::make_unique<std::mutex>();
-                            std::lock_guard lock(*hook->mutex);
+                        if (od_notify_publishers_.count(index) > 0) {
+                            RCLCPP_INFO(this->get_logger(), "ODNotify topic \"%s\" is already published.", topic_name.c_str());
+                        } else {
                             auto publisher = this->create_publisher<cogtwa_interfaces::msg::ODWriteNotify>(topic_name, 10);
-                            hook->node = this;
-                            hook->queue = &this->od_notify_queue_;
                             od_notify_publishers_.emplace(index, publisher);
-                            hook->enabled = true;
+
+                            od_extension_.on_write(index, [this, index](OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written){
+                                ODWriteNotifyData notify;
+                                notify.index = index;
+                                notify.sub_index = stream->subIndex;
+                                notify.data.resize(size);
+                                std::memcpy(notify.data.data(), buf, size);
+
+                                this->push_od_notify(std::move(notify));
+
+                                return OD_writeOriginal(stream, buf, size, size_written);
+                            });
                         }
 
                         resp->ok = true;
@@ -251,7 +223,7 @@ public:
         while (true) {
             try {
                 const auto notify = od_notify_queue_.pull();
-                this->publish_od_notify(notify);
+                this->publish_od_notify((notify));
             } catch (const boost::sync_queue_is_closed &) {
                 break;
             }
@@ -280,23 +252,7 @@ private:
 
     std::unordered_map<std::uint16_t, std::shared_ptr<ODWriteNotifyPublisher>> od_notify_publishers_;
 
-    AssociativeArena<std::uint16_t, ODEntryHook> arena_;
-
-    static ODR_t od_write(OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written) {
-        ODEntryHook *hook = static_cast<ODEntryHook *>(stream->object);
-        if (hook->enabled) {
-            std::lock_guard lock(*hook->mutex);
-            ODWriteNotifyData info;
-            info.index = hook->index;
-            info.sub_index = stream->subIndex;
-            info.data.resize(size);
-            std::memcpy(info.data.data(), buf, size);
-    
-            hook->node->push_od_notify(std::move(info));
-        }
-        return OD_writeOriginal(stream, buf, size, size_written);
-    }
-
+    ODExtension od_extension_;
 };
 
 using namespace std::chrono_literals;
@@ -410,10 +366,14 @@ int main(int argc, char **argv) {
                 if (should_die.load()) {
                     break;
                 }
-                CO_epoll_processRT(&ep_main, CO, false);
-                CO_epoll_processMain(&ep_main, CO, true, &reset);
-                CO_epoll_processGtw(&ep_gtw, CO, &ep_main);
-                CO_epoll_processLast(&ep_main);
+                {
+                    std::lock_guard lock(co_global_mutex);
+
+                    CO_epoll_processRT(&ep_main, CO, false);
+                    CO_epoll_processMain(&ep_main, CO, true, &reset);
+                    CO_epoll_processGtw(&ep_gtw, CO, &ep_main);
+                    CO_epoll_processLast(&ep_main);
+                }
             }
         });
 
