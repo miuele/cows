@@ -7,12 +7,14 @@
 class ODExtension {
 private:
     using WriteCallbackType = ODR_t (OD_stream_t *, const void *, OD_size_t, OD_size_t *);
+    using ReadCallbackType = ODR_t (OD_stream_t *, void *, OD_size_t, OD_size_t *);
 
     struct Hook {
-        std::uint16_t index;
         OD_extension_t od_extension;
-        std::function<WriteCallbackType> callback;
-        std::function<WriteCallbackType> callback_new;
+        std::function<WriteCallbackType> callback_write;
+        std::function<WriteCallbackType> callback_write_new;
+        std::function<ReadCallbackType> callback_read;
+        std::function<ReadCallbackType> callback_read_new;
         std::unique_ptr<std::mutex> mutex;
     };
 
@@ -38,10 +40,9 @@ public:
 
         for (std::uint16_t index : user_od_indices) {
             Hook *hook = std::get<HooksArena>(arena_).emplace(index);
-            hook->index = index;
             hook->od_extension.object = hook;
             hook->od_extension.write = &ODExtension::od_write;
-            hook->callback = nullptr;
+            hook->od_extension.read = &ODExtension::od_read;
             hook->mutex = std::make_unique<std::mutex>();
 
             OD_extension_init(OD_find(od, index), &hook->od_extension);
@@ -54,7 +55,15 @@ public:
         Hook *hook = std::get<HooksArena>(arena_).get(index);
 
         std::lock_guard<std::mutex> lock(*hook->mutex);
-        hook->callback_new = std::forward<F>(func);
+        hook->callback_write_new = std::forward<F>(func);
+    }
+
+    template <class F>
+    void on_read(std::uint16_t index, F &&func) {
+        Hook *hook = std::get<HooksArena>(arena_).get(index);
+
+        std::lock_guard<std::mutex> lock(*hook->mutex);
+        hook->callback_read_new = std::forward<F>(func);
     }
 
 private:
@@ -68,19 +77,43 @@ private:
         Hook *hook = static_cast<Hook *>(stream->object);
         {
             std::lock_guard<std::mutex> lock(*hook->mutex);
-            if (hook->callback_new) {
-                hook->callback = std::move(hook->callback_new);
-                hook->callback_new = nullptr;
+            if (hook->callback_write_new) {
+                hook->callback_write = std::move(hook->callback_write_new);
+                hook->callback_write_new = nullptr;
             }
             /*
-             * hook->callback is guaranteed to be valid until next call to this function
+             * hook->callback_write is guaranteed to be valid until next call to this function
              */
         }
 
-        if (hook->callback) {
-            return (hook->callback)(stream, buf, size, size_written);
+        if (hook->callback_write) {
+            return (hook->callback_write)(stream, buf, size, size_written);
         }
         return OD_writeOriginal(stream, buf, size, size_written);
+    }
+
+    static ODR_t od_read(
+            OD_stream_t *stream,
+            void *buf,
+            OD_size_t size,
+            OD_size_t *size_read)
+    {
+        Hook *hook = static_cast<Hook *>(stream->object);
+        {
+            std::lock_guard<std::mutex> lock(*hook->mutex);
+            if (hook->callback_read_new) {
+                hook->callback_read = std::move(hook->callback_read_new);
+                hook->callback_read_new = nullptr;
+            }
+            /*
+             * hook->callback_read is guaranteed to be valid until next call to this function
+             */
+        }
+
+        if (hook->callback_read) {
+            return (hook->callback_read)(stream, buf, size, size_read);
+        }
+        return OD_readOriginal(stream, buf, size, size_read);
     }
 
     std::variant<std::monostate, HooksArena> arena_;
