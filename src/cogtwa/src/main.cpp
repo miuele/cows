@@ -13,7 +13,7 @@
 #include "cogtwa_interfaces/srv/sdo_read.hpp"
 #include "cogtwa_interfaces/srv/sdo_write.hpp"
 #include "cogtwa_interfaces/srv/configure_od_notify.hpp"
-#include "cogtwa_interfaces/msg/notify_od_write.hpp"
+#include "cogtwa_interfaces/msg/od_write_notify.hpp"
 
 #include <syslog.h>
 
@@ -26,6 +26,7 @@ extern "C" {
 #include "CO_storageLinux.h"
 
 #include "cogtwa/CO_utils.hpp"
+#include "cogtwa/assoc_arena.hpp"
 
 #define MAIN_THREAD_INTERVAL_US 100'000
 #define NMT_CONTROL (static_cast<CO_NMT_control_t>( \
@@ -42,32 +43,16 @@ extern "C" {
 #define CO_ERROR_MSG_MAX_LEN 128
 #endif
 
+using assoc_arena::AssociativeArena;
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
 
-std::string notify_od_write_topic_name(std::uint16_t index) {
-    char a[8]{};
+std::string od_write_notify_topic_name(std::uint16_t index) {
+    char a[9]{};
     std::to_chars(std::begin(a), std::end(a), index, 16);
-    return "notify_od_write_0x"s + a;
+    return "od_write_notify_0x"s + a;
 }
-
-struct ODWriteNotifyData {
-    std::uint16_t index;
-    std::uint8_t sub_index;
-    std::vector<std::uint8_t> data;
-};
-
-struct ODWriteCallbackContext {
-    boost::sync_queue<ODWriteNotifyData> *notification_queue;
-    std::uint16_t index;
-};
-
-struct ODEntryHook {
-    std::shared_ptr<rclcpp::Publisher<cogtwa_interfaces::msg::NotifyODWrite>> notify_od_write_publisher;
-    std::unique_ptr<OD_extension_t> od_extension;
-    std::unique_ptr<ODWriteCallbackContext> callback_context;
-};
 
 void log_printf(int priority, const char *format, ...) {
     char buffer[CO_ERROR_MSG_MAX_LEN];
@@ -94,10 +79,68 @@ void log_printf(int priority, const char *format, ...) {
 class COGtwa
     : public rclcpp::Node
 {
+private:
+
+    using ODReadService = rclcpp::Service<cogtwa_interfaces::srv::ODRead>;
+    using ODWriteService = rclcpp::Service<cogtwa_interfaces::srv::ODWrite>;
+
+    using SDOReadService = rclcpp::Service<cogtwa_interfaces::srv::SDORead>;
+    using SDOWriteService = rclcpp::Service<cogtwa_interfaces::srv::SDOWrite>;
+
+    using ConfigureODNotifyService = rclcpp::Service<cogtwa_interfaces::srv::ConfigureODNotify>;
+
+    using ODWriteNotifyPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::ODWriteNotify>;
+
+    struct ODWriteNotifyData {
+        std::uint16_t index;
+        std::uint8_t sub_index;
+        std::vector<std::uint8_t> data;
+    };
+
+    struct ODEntryHook {
+        ODEntryHook(ODEntryHook &&other)
+            : enabled(other.enabled.load())
+              , index(other.index)
+              , queue(other.queue)
+              , od_extension(std::move(other.od_extension))
+              , node(other.node)
+              , mutex(std::move(other.mutex))
+        {
+        }
+
+        ODEntryHook(COGtwa *nod, std::uint16_t ind)
+            : enabled(false), index(ind), queue(nullptr), od_extension{}, node(nod)
+        {
+        }
+
+        std::atomic<bool> enabled;
+        std::uint16_t index;
+        boost::sync_queue<ODWriteNotifyData> *queue;
+        OD_extension_t od_extension;
+        COGtwa *node;
+
+        std::unique_ptr<std::mutex> mutex;
+    };
 public:
-    COGtwa(CO_t *CO, OD_t *OD, boost::sync_queue<ODWriteNotifyData> *od_notify_queue)
-        : Node("cogtwa")
+    COGtwa(CO_t *CO, OD_t *OD)
+        : Node("cogtwa"), arena_(128)
     {
+        std::vector<std::uint16_t> user_od_indices;
+        for (OD_entry_t *entry = OD_find(OD, 0x2000); entry < (OD->list + OD->size); ++entry) {
+            std::uint16_t index = OD_getIndex(entry);
+            if (index > 0x2FFF) {
+                break;
+            }
+            user_od_indices.push_back(index);
+        }
+
+        for (std::uint16_t index : user_od_indices) {
+            ODEntryHook *hook = arena_.emplace(index, this, index);
+            hook->od_extension.object = hook;
+            hook->od_extension.write = &COGtwa::od_write;
+            OD_extension_init(OD_find(OD, index), &hook->od_extension);
+        }
+
         sdo_callback_group_ =
             this->create_callback_group(
                     rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -171,45 +214,24 @@ public:
         service_configure_od_notify_ =
             this->create_service<cogtwa_interfaces::srv::ConfigureODNotify>(
                     "configure_od_notify",
-                    [this, CO, OD, od_notify_queue](
+                    [this, CO, OD](
                         const std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ConfigureODNotify::Response> resp
                         ) {
-                        
-                        OD_entry_t *entry = OD_find(OD, req->index);
-                        if (entry->extension) {
-                            RCLCPP_WARN(this->get_logger(), "OD extension on index 0x%X already registered, overriding.", req->index);
+
+                        auto index = req->index;
+                        auto topic_name = od_write_notify_topic_name(index);
+
+                        ODEntryHook *hook = arena_.get(index);
+                        if (!hook->enabled) {
+                            hook->mutex = std::make_unique<std::mutex>();
+                            std::lock_guard lock(*hook->mutex);
+                            auto publisher = this->create_publisher<cogtwa_interfaces::msg::ODWriteNotify>(topic_name, 10);
+                            hook->node = this;
+                            hook->queue = &this->od_notify_queue_;
+                            od_notify_publishers_.emplace(index, publisher);
+                            hook->enabled = true;
                         }
-
-                        auto topic_name = notify_od_write_topic_name(req->index);
-                        ODEntryHook hook;
-
-                        hook.notify_od_write_publisher = this->create_publisher<cogtwa_interfaces::msg::NotifyODWrite>(topic_name, 10);
-
-                        hook.callback_context = std::make_unique<ODWriteCallbackContext>();
-                        hook.callback_context->notification_queue = od_notify_queue;
-                        hook.callback_context->index = req->index;
-
-                        hook.od_extension = std::make_unique<OD_extension_t>();
-                        hook.od_extension->object = hook.callback_context.get();
-                        hook.od_extension->read = OD_readOriginal;
-                        hook.od_extension->write = [](OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written) {
-                                ODWriteCallbackContext *ctx = static_cast<ODWriteCallbackContext *>(stream->object);
-
-                                ODWriteNotifyData info;
-                                info.index = ctx->index;
-                                info.sub_index = stream->subIndex;
-                                info.data.resize(size);
-                                std::memcpy(info.data.data(), buf, size);
-
-                                ctx->notification_queue->push(std::move(info));
-
-                                return OD_writeOriginal(stream, buf, size, size_written);
-                            };
-
-                        OD_extension_init(entry, hook.od_extension.get());
-
-                        od_hooks_.insert_or_assign(req->index, std::move(hook));
 
                         resp->ok = true;
                         resp->topic_name = topic_name;
@@ -217,35 +239,64 @@ public:
 
     }
 
-    void publish_od_notify(const ODWriteNotifyData &event) {
-        auto &hook = od_hooks_[event.index];
-        cogtwa_interfaces::msg::NotifyODWrite msg;
-        msg.index = event.index;
-        msg.sub_index = event.sub_index;
-        msg.data = std::move(event.data);
+    void push_od_notify(ODWriteNotifyData notify) {
+        od_notify_queue_.push(std::move(notify));
+    }
 
-        hook.notify_od_write_publisher->publish(msg);
+    void close_od_notify() {
+        od_notify_queue_.close();
+    }
+
+    void run_od_notify_publisher_thread() {
+        while (true) {
+            try {
+                const auto notify = od_notify_queue_.pull();
+                this->publish_od_notify(notify);
+            } catch (const boost::sync_queue_is_closed &) {
+                break;
+            }
+        }
+    }
+
+    void publish_od_notify(const ODWriteNotifyData &notify) {
+        cogtwa_interfaces::msg::ODWriteNotify msg;
+        msg.index = notify.index;
+        msg.sub_index = notify.sub_index;
+        msg.data = std::move(notify.data);
+
+        od_notify_publishers_[notify.index]->publish(msg);
     }
 
 private:
     std::shared_ptr<rclcpp::CallbackGroup> sdo_callback_group_;
 
-    std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::ODRead>> service_od_read_;
+    std::shared_ptr<ODReadService> service_od_read_;
+    std::shared_ptr<ODWriteService> service_od_write_;
+    std::shared_ptr<SDOReadService> service_sdo_read_;
+    std::shared_ptr<SDOWriteService> service_sdo_write_;
+    std::shared_ptr<ConfigureODNotifyService> service_configure_od_notify_;
 
-    std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::ODWrite>> service_od_write_;
+    boost::sync_queue<ODWriteNotifyData> od_notify_queue_;
 
-    std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::SDORead>> service_sdo_read_;
+    std::unordered_map<std::uint16_t, std::shared_ptr<ODWriteNotifyPublisher>> od_notify_publishers_;
 
-    std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::SDOWrite>> service_sdo_write_;
+    AssociativeArena<std::uint16_t, ODEntryHook> arena_;
 
-    std::shared_ptr<
-        rclcpp::Service<cogtwa_interfaces::srv::ConfigureODNotify>> service_configure_od_notify_;
+    static ODR_t od_write(OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written) {
+        ODEntryHook *hook = static_cast<ODEntryHook *>(stream->object);
+        if (hook->enabled) {
+            std::lock_guard lock(*hook->mutex);
+            ODWriteNotifyData info;
+            info.index = hook->index;
+            info.sub_index = stream->subIndex;
+            info.data.resize(size);
+            std::memcpy(info.data.data(), buf, size);
+    
+            hook->node->push_od_notify(std::move(info));
+        }
+        return OD_writeOriginal(stream, buf, size, size_written);
+    }
 
-    std::unordered_map<std::uint16_t, ODEntryHook> od_hooks_;
 };
 
 using namespace std::chrono_literals;
@@ -352,8 +403,6 @@ int main(int argc, char **argv) {
 
     std::atomic<bool> should_die{false};
 
-    boost::sync_queue<ODWriteNotifyData> od_notify_queue;
-
     std::thread co_rtml_thread([&] {
             CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
             while (reset == CO_RESET_NOT) {
@@ -368,18 +417,9 @@ int main(int argc, char **argv) {
             }
         });
 
-    auto node = std::make_shared<COGtwa>(CO, OD, &od_notify_queue);
+    auto node = std::make_shared<COGtwa>(CO, OD);
 
-    std::thread od_notify_publisher_thread([&] {
-            while (true) {
-                try {
-                    auto event = od_notify_queue.pull();
-                    node->publish_od_notify(event);
-                } catch (const boost::sync_queue_is_closed &) {
-                    break;
-                }
-            }
-        });
+    std::thread od_notify_publisher_thread(std::bind(&COGtwa::run_od_notify_publisher_thread, node));
 
 
     rclcpp::executors::MultiThreadedExecutor executor;
@@ -396,7 +436,7 @@ int main(int argc, char **argv) {
 
     co_rtml_thread.join();
 
-    od_notify_queue.close();
+    node->close_od_notify();
     od_notify_publisher_thread.join();
 
 	CO_epoll_close(&ep_main);
