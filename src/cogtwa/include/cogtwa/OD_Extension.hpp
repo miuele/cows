@@ -6,10 +6,13 @@
 
 class ODExtension {
 private:
+    using WriteCallbackType = ODR_t (OD_stream_t *, const void *, OD_size_t, OD_size_t *);
+
     struct Hook {
         std::uint16_t index;
         OD_extension_t od_extension;
-        std::function<ODR_t (OD_stream_t *, const void *, OD_size_t, OD_size_t *)> callback;
+        std::function<WriteCallbackType> callback;
+        std::function<WriteCallbackType> callback_new;
         std::unique_ptr<std::mutex> mutex;
     };
 
@@ -51,7 +54,7 @@ public:
         Hook *hook = std::get<HooksArena>(arena_).get(index);
 
         std::lock_guard<std::mutex> lock(*hook->mutex);
-        hook->callback = std::forward<F>(func);
+        hook->callback_new = std::forward<F>(func);
     }
 
 private:
@@ -63,14 +66,19 @@ private:
             OD_size_t *size_written)
     {
         Hook *hook = static_cast<Hook *>(stream->object);
-        decltype(hook->callback) callback;
         {
             std::lock_guard<std::mutex> lock(*hook->mutex);
-            callback = hook->callback;
+            if (hook->callback_new) {
+                hook->callback = std::move(hook->callback_new);
+                hook->callback_new = nullptr;
+            }
+            /*
+             * hook->callback is guaranteed to be valid until next call to this function
+             */
         }
 
-        if (callback) {
-            return callback(stream, buf, size, size_written);
+        if (hook->callback) {
+            return (hook->callback)(stream, buf, size, size_written);
         }
         return OD_writeOriginal(stream, buf, size, size_written);
     }
