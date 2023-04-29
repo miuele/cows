@@ -3,6 +3,9 @@
 
 #include "cogtwa/assoc_arena.hpp"
 #include <variant>
+#include <functional>
+#include <memory>
+#include <mutex>
 
 class ODExtension {
 private:

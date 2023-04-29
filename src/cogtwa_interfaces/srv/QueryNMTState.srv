@@ -1,0 +1,4 @@
+uint8 node_id
+---
+bool ok
+int8 nmt_state

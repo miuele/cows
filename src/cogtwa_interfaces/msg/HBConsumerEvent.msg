@@ -1,0 +1,7 @@
+uint8 index
+uint8 node_id
+int8 hb_consumer_event
+
+int8 HB_CONSUMER_EVENT_HEARTBEAT_STARTED=0
+int8 HB_CONSUMER_EVENT_TIMEOUT=1
+int8 HB_CONSUMER_EVENT_REMOTE_RESET=2

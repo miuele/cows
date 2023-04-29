@@ -17,7 +17,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     "srv/SDORead.srv"
     "srv/SDOWrite.srv"
     "srv/ConfigureODNotify.srv"
+    "srv/QueryNMTState.srv"
     "msg/ODWriteNotify.msg"
+    "msg/NMTState.msg"
+    "msg/HBConsumerEvent.msg"
 )
 
 if(BUILD_TESTING)

@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <thread>
 #include <charconv>
+#include <variant>
 
 #include <boost/thread/sync_queue.hpp>
 
@@ -13,7 +14,10 @@
 #include "cogtwa_interfaces/srv/sdo_read.hpp"
 #include "cogtwa_interfaces/srv/sdo_write.hpp"
 #include "cogtwa_interfaces/srv/configure_od_notify.hpp"
+#include "cogtwa_interfaces/srv/query_nmt_state.hpp"
 #include "cogtwa_interfaces/msg/od_write_notify.hpp"
+#include "cogtwa_interfaces/msg/nmt_state.hpp"
+#include "cogtwa_interfaces/msg/hb_consumer_event.hpp"
 
 #include <syslog.h>
 
@@ -27,7 +31,7 @@ extern "C" {
 
 #include "cogtwa/CO_utils.hpp"
 #include "cogtwa/OD_Extension.hpp"
-#include "cogtwa/assoc_arena.hpp"
+#include "cogtwa/HB_Consumer.hpp"
 
 #define MAIN_THREAD_INTERVAL_US 100'000
 #define NMT_CONTROL (static_cast<CO_NMT_control_t>( \
@@ -90,17 +94,35 @@ private:
 
     using ConfigureODNotifyService = rclcpp::Service<cogtwa_interfaces::srv::ConfigureODNotify>;
 
+    using QueryNMTStateService = rclcpp::Service<cogtwa_interfaces::srv::QueryNMTState>;
+
     using ODWriteNotifyPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::ODWriteNotify>;
+    using NMTStatePublisher = rclcpp::Publisher<cogtwa_interfaces::msg::NMTState>;
+    using HBConsumerEventPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::HBConsumerEvent>;
 
     struct ODWriteNotifyData {
-        std::uint16_t index;
+        std::uint8_t index;
         std::uint8_t sub_index;
         std::vector<std::uint8_t> data;
     };
 
+    struct NMTStateData {
+        std::uint8_t node_id;
+        std::uint8_t index;
+        CO_NMT_internalState_t state;
+    };
+
+    struct HBConsumerEventData {
+        std::uint8_t node_id;
+        std::uint8_t index;
+        HBConsumerEvent event;
+    };
+
+    using PublisherDataVariant = std::variant<ODWriteNotifyData, NMTStateData, HBConsumerEventData>;
+
 public:
     COGtwa(CO_t *CO, OD_t *OD)
-        : Node("cogtwa"), od_extension_(OD)
+        : Node("cogtwa"), od_extension_(OD), hb_consumer_(CO->HBcons)
     {
 
         sdo_callback_group_ =
@@ -199,7 +221,7 @@ public:
                                 notify.data.resize(size);
                                 std::memcpy(notify.data.data(), buf, size);
 
-                                this->push_od_notify(std::move(notify));
+                                this->push_publisher_data(std::move(notify));
 
                                 return OD_writeOriginal(stream, buf, size, size_written);
                             });
@@ -209,21 +231,74 @@ public:
                         resp->topic_name = topic_name;
                     });
 
+        service_query_nmt_state_ =
+            this->create_service<cogtwa_interfaces::srv::QueryNMTState>(
+                    "query_nmt_state",
+                    [this, hbcons = CO->HBcons](
+                        const std::shared_ptr<cogtwa_interfaces::srv::QueryNMTState::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::QueryNMTState::Response> resp
+                        ) {
+                        auto node_id = req->node_id;
+
+                        std::lock_guard lock(co_global_mutex);
+
+                        auto index = CO_HBconsumer_getIdxByNodeId(hbcons, node_id);
+                        if (index == -1) {
+                            resp->ok = false;
+                            return;
+                        }
+                        CO_NMT_internalState_t state;
+                        if (CO_HBconsumer_getNmtState(hbcons, index, &state) == -1) {
+                            state = CO_NMT_UNKNOWN;
+                        }
+                        resp->ok = true;
+                        resp->nmt_state = state;
+                    });
+
+        nmt_state_publisher_ = this->create_publisher<cogtwa_interfaces::msg::NMTState>("nmt_state", 10);
+        hb_consumer_event_publisher_ = this->create_publisher<cogtwa_interfaces::msg::HBConsumerEvent>("hb_consumer_event", 10);
+
+        hb_consumer_.on_nmt_state_changed([this](std::uint8_t node_id, std::uint8_t index, CO_NMT_internalState_t state) {
+                    RCLCPP_DEBUG(this->get_logger(), "node %u (index: %u) state changed to %d", node_id, index, state);
+
+                    NMTStateData state_data{node_id, index, state};
+                    this->push_publisher_data(std::move(state_data));
+                });
+
+        hb_consumer_.on_hb_consumer_event([this](std::uint8_t node_id, std::uint8_t index, HBConsumerEvent event) {
+                    RCLCPP_DEBUG(this->get_logger(), "node %u (index: %u) event: %d", node_id, index, static_cast<int>(event));
+
+                    HBConsumerEventData event_data{node_id, index, event};
+                    this->push_publisher_data(std::move(event_data));
+                });
     }
 
-    void push_od_notify(ODWriteNotifyData notify) {
-        od_notify_queue_.push(std::move(notify));
+    void push_publisher_data(PublisherDataVariant &&data) {
+        publisher_data_queue_.push(std::move(data));
     }
 
-    void close_od_notify() {
-        od_notify_queue_.close();
+    void close_publisher_data_queue() {
+        publisher_data_queue_.close();
     }
 
-    void run_od_notify_publisher_thread() {
+    void run_publisher_thread() {
+        struct {
+            void operator()(const ODWriteNotifyData &notify) {
+                node->publish_od_notify(notify);
+            }
+            void operator()(const NMTStateData &data) {
+                node->publish_nmt_state(data);
+            }
+            void operator()(const HBConsumerEventData &data) {
+                node->publish_hb_consumer_event(data);
+            }
+            COGtwa *node;
+        } publish_data{this};
+
         while (true) {
             try {
-                const auto notify = od_notify_queue_.pull();
-                this->publish_od_notify((notify));
+                const auto data = publisher_data_queue_.pull();
+                std::visit(publish_data, data);
             } catch (const boost::sync_queue_is_closed &) {
                 break;
             }
@@ -239,6 +314,24 @@ public:
         od_notify_publishers_[notify.index]->publish(msg);
     }
 
+    void publish_nmt_state(const NMTStateData &data) {
+        cogtwa_interfaces::msg::NMTState msg;
+        msg.node_id = data.node_id;
+        msg.index = data.index;
+        msg.nmt_state = static_cast<std::int8_t>(data.state);
+
+        nmt_state_publisher_->publish(msg);
+    }
+
+    void publish_hb_consumer_event(const HBConsumerEventData &data) {
+        cogtwa_interfaces::msg::HBConsumerEvent msg;
+        msg.node_id = data.node_id;
+        msg.index = data.index;
+        msg.hb_consumer_event = static_cast<std::int8_t>(data.event);
+
+        hb_consumer_event_publisher_->publish(msg);
+    }
+
 private:
     std::shared_ptr<rclcpp::CallbackGroup> sdo_callback_group_;
 
@@ -247,12 +340,17 @@ private:
     std::shared_ptr<SDOReadService> service_sdo_read_;
     std::shared_ptr<SDOWriteService> service_sdo_write_;
     std::shared_ptr<ConfigureODNotifyService> service_configure_od_notify_;
+    std::shared_ptr<QueryNMTStateService> service_query_nmt_state_;
 
-    boost::sync_queue<ODWriteNotifyData> od_notify_queue_;
+    boost::sync_queue<PublisherDataVariant> publisher_data_queue_;
 
     std::unordered_map<std::uint16_t, std::shared_ptr<ODWriteNotifyPublisher>> od_notify_publishers_;
 
+    std::shared_ptr<NMTStatePublisher> nmt_state_publisher_;
+    std::shared_ptr<HBConsumerEventPublisher> hb_consumer_event_publisher_;
+
     ODExtension od_extension_;
+    HBConsumer hb_consumer_;
 };
 
 using namespace std::chrono_literals;
@@ -379,7 +477,7 @@ int main(int argc, char **argv) {
 
     auto node = std::make_shared<COGtwa>(CO, OD);
 
-    std::thread od_notify_publisher_thread(std::bind(&COGtwa::run_od_notify_publisher_thread, node));
+    std::thread publisher_thread(std::bind(&COGtwa::run_publisher_thread, node));
 
 
     rclcpp::executors::MultiThreadedExecutor executor;
@@ -396,8 +494,8 @@ int main(int argc, char **argv) {
 
     co_rtml_thread.join();
 
-    node->close_od_notify();
-    od_notify_publisher_thread.join();
+    node->close_publisher_data_queue();
+    publisher_thread.join();
 
 	CO_epoll_close(&ep_main);
     CO_epoll_closeGtw(&ep_gtw);
