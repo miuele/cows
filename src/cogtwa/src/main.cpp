@@ -35,10 +35,9 @@ extern "C" {
 
 #define MAIN_THREAD_INTERVAL_US 100'000
 #define NMT_CONTROL (static_cast<CO_NMT_control_t>( \
-			CO_NMT_STARTUP_TO_OPERATIONAL \
-			| CO_NMT_ERR_ON_ERR_REG \
-			| CO_ERR_REG_GENERIC_ERR \
-			| CO_ERR_REG_COMMUNICATION))
+            CO_NMT_STARTUP_TO_OPERATIONAL \
+            | CO_ERR_REG_GENERIC_ERR \
+            | CO_ERR_REG_COMMUNICATION))
 
 #define FIRST_HB_TIME 500
 #define SDO_SRV_TIMEOUT_TIME 1000
@@ -59,10 +58,10 @@ std::string od_write_notify_topic_name(std::uint16_t index) {
 
 void log_printf(int priority, const char *format, ...) {
     char buffer[CO_ERROR_MSG_MAX_LEN];
-	std::va_list ap;
+    std::va_list ap;
 
     va_start(ap, format);
-	vsnprintf(buffer, std::size(buffer), format, ap);
+    vsnprintf(buffer, std::size(buffer), format, ap);
     va_end(ap);
     rclcpp::Logger logger = rclcpp::get_logger("CANopen");
 
@@ -101,7 +100,7 @@ private:
     using HBConsumerEventPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::HBConsumerEvent>;
 
     struct ODWriteNotifyData {
-        std::uint8_t index;
+        std::uint16_t index;
         std::uint8_t sub_index;
         std::vector<std::uint8_t> data;
     };
@@ -150,9 +149,20 @@ public:
                         const std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Request> req,
                         std::shared_ptr<cogtwa_interfaces::srv::ODWrite::Response> resp
                       ) {
+                        OD_entry_t *entry = OD_find(OD, req->index);
+
                         ScopedODLock lock(can_module);
-                        resp->ok = OD_set_value(OD_find(OD, req->index), req->sub_index, req->data.data(), req->data.size(), false)
-                            == ODR_OK;
+
+                        if (req->data.size() > 0) {
+                            resp->ok = OD_set_value(entry, req->sub_index, req->data.data(), req->data.size(), req->no_notify)
+                                == ODR_OK;
+                        }
+
+                        if (req->request_tpdo) {
+                            uint8_t *flags_pdo = OD_getFlagsPDO(entry);
+                            assert(flags_pdo);
+                            OD_requestTPDO(flags_pdo, req->sub_index);
+                        }
                     });
 
         service_sdo_read_ =
@@ -208,23 +218,30 @@ public:
                         auto index = req->index;
                         auto topic_name = od_write_notify_topic_name(index);
 
-                        if (od_notify_publishers_.count(index) > 0) {
-                            RCLCPP_INFO(this->get_logger(), "ODNotify topic \"%s\" is already published.", topic_name.c_str());
+                        if (req->on_write) {
+                            if (od_notify_publishers_.count(index) > 0) {
+                                RCLCPP_INFO(this->get_logger(), "ODNotify topic \"%s\" is already activated.", topic_name.c_str());
+                            } else {
+                                auto publisher = this->create_publisher<cogtwa_interfaces::msg::ODWriteNotify>(topic_name, 10);
+                                RCLCPP_INFO(this->get_logger(), "activating ODNotify topic \"%s\".", topic_name.c_str());
+                                od_notify_publishers_.emplace(index, publisher);
+
+                                od_extension_.on_write(index, [this, index](OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written){
+
+                                    ODWriteNotifyData notify;
+                                    notify.index = index;
+                                    notify.sub_index = stream->subIndex;
+                                    notify.data.resize(size);
+                                    std::memcpy(notify.data.data(), buf, size);
+
+                                    this->push_publisher_data(std::move(notify));
+
+                                    return OD_writeOriginal(stream, buf, size, size_written);
+                                });
+                            }
                         } else {
-                            auto publisher = this->create_publisher<cogtwa_interfaces::msg::ODWriteNotify>(topic_name, 10);
-                            od_notify_publishers_.emplace(index, publisher);
-
-                            od_extension_.on_write(index, [this, index](OD_stream_t *stream, const void *buf, OD_size_t size, OD_size_t *size_written){
-                                ODWriteNotifyData notify;
-                                notify.index = index;
-                                notify.sub_index = stream->subIndex;
-                                notify.data.resize(size);
-                                std::memcpy(notify.data.data(), buf, size);
-
-                                this->push_publisher_data(std::move(notify));
-
-                                return OD_writeOriginal(stream, buf, size, size_written);
-                            });
+                            od_notify_publishers_.erase(index);
+                            od_extension_.on_write(index, nullptr);
                         }
 
                         resp->ok = true;
@@ -284,7 +301,7 @@ public:
     void run_publisher_thread() {
         struct {
             void operator()(const ODWriteNotifyData &notify) {
-                node->publish_od_notify(notify);
+                node->publish_od_notify(std::move(notify));
             }
             void operator()(const NMTStateData &data) {
                 node->publish_nmt_state(data);
@@ -298,6 +315,10 @@ public:
         while (true) {
             try {
                 const auto data = publisher_data_queue_.pull();
+                if (std::holds_alternative<ODWriteNotifyData>(data)) {
+                    auto index = std::get<ODWriteNotifyData>(data).data.size();
+                    RCLCPP_DEBUG(this->get_logger(), "publishing for size: %zu", index);
+                }
                 std::visit(publish_data, data);
             } catch (const boost::sync_queue_is_closed &) {
                 break;
@@ -311,7 +332,7 @@ public:
         msg.sub_index = notify.sub_index;
         msg.data = std::move(notify.data);
 
-        od_notify_publishers_[notify.index]->publish(msg);
+        od_notify_publishers_.at(notify.index)->publish(msg);
     }
 
     void publish_nmt_state(const NMTStateData &data) {
@@ -355,26 +376,51 @@ private:
 
 using namespace std::chrono_literals;
 
+struct parameters_t {
+    std::string can_interface;
+    std::string gtwa_interface;
+    std::uint16_t node_id;
+};
+
+void collect_parameters(parameters_t &params) {
+    auto node_init = std::make_shared<rclcpp::Node>("cogtwa_init");
+    node_init->declare_parameter("can_interface", "can0");
+    node_init->declare_parameter("gtwa_interface", "/tmp/CO_command_socket");
+    node_init->declare_parameter("node_id", 3);
+
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node_init);
+
+    params.can_interface = node_init->get_parameter("can_interface").as_string();
+    params.gtwa_interface = node_init->get_parameter("gtwa_interface").as_string();
+    params.node_id = node_init->get_parameter("node_id").as_int();
+
+    executor.spin_some();
+}
+
 int main(int argc, char **argv) {
 
     rclcpp::init(argc, argv);
 
+    parameters_t params;
+    collect_parameters(params);
+
     CO_CANptrSocketCan_t CANptr{};
 
-    CANptr.can_ifindex = if_nametoindex("vcan0");
+    CANptr.can_ifindex = if_nametoindex(params.can_interface.c_str());
     if (CANptr.can_ifindex == 0) {
-        log_printf(LOG_CRIT, DBG_NO_CAN_DEVICE, "vcan0");
+        log_printf(LOG_CRIT, DBG_NO_CAN_DEVICE, params.can_interface.c_str());
         std::exit(EXIT_FAILURE);
     }
 
-	std::uint32_t heap_used = 0;
-	CO_t *CO = CO_new(nullptr, &heap_used);
-	if (CO == nullptr) {
-		log_printf(LOG_CRIT, DBG_GENERAL, "CO_new(), heap_used=", heap_used);
-		std::exit(EXIT_FAILURE);
-	}
+    std::uint32_t heap_used = 0;
+    CO_t *CO = CO_new(nullptr, &heap_used);
+    if (CO == nullptr) {
+        log_printf(LOG_CRIT, DBG_GENERAL, "CO_new(), heap_used=", heap_used);
+        std::exit(EXIT_FAILURE);
+    }
 
-	CO_epoll_t ep_main;
+    CO_epoll_t ep_main;
     {
         CO_ReturnError_t err = CO_epoll_create(&ep_main, MAIN_THREAD_INTERVAL_US);
         if (err != CO_ERROR_NO) {
@@ -389,71 +435,70 @@ int main(int argc, char **argv) {
     ev.data.fd = app_eventfd;
     epoll_ctl(ep_main.epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev);
 
-	CANptr.epoll_fd = ep_main.epoll_fd;
+    CANptr.epoll_fd = ep_main.epoll_fd;
 
     CO_epoll_gtw_t ep_gtw;
     {
-        static char socket_path[] = "/tmp/CO_command_socket";
         CO_ReturnError_t err = CO_epoll_createGtw(
                 &ep_gtw,
                 ep_main.epoll_fd,
                 CO_COMMAND_IF_LOCAL_SOCKET,
                 1000,
-                socket_path);
+                params.gtwa_interface.data());
         if (err != CO_ERROR_NO) {
             log_printf(LOG_CRIT, DBG_GENERAL, "CO_epoll_createGtw(), err=", err);
             std::exit(EXIT_FAILURE);
         }
     }
 
-	{
-		CO_CANsetConfigurationMode(&CANptr);
-		CO_CANmodule_disable(CO->CANmodule);
-		CO_ReturnError_t err = CO_CANinit(CO, &CANptr, 0);
-		if (err != CO_ERROR_NO) {
-			log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANinit()", err);
-			std::exit(EXIT_FAILURE);
-		}
-	}
+    {
+        CO_CANsetConfigurationMode(&CANptr);
+        CO_CANmodule_disable(CO->CANmodule);
+        CO_ReturnError_t err = CO_CANinit(CO, &CANptr, 0);
+        if (err != CO_ERROR_NO) {
+            log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANinit()", err);
+            std::exit(EXIT_FAILURE);
+        }
+    }
 
-	{
-		std::uint32_t err_info = 0;
-		CO_ReturnError_t err = CO_CANopenInit(
-				CO, nullptr, nullptr, OD, nullptr, 
-				NMT_CONTROL,
-				FIRST_HB_TIME,
-				SDO_SRV_TIMEOUT_TIME,
-				SDO_CLI_TIMEOUT_TIME,
-				false,
-				3,
-				&err_info);
-		if (err != CO_ERROR_NO && err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
-			if (err == CO_ERROR_OD_PARAMETERS) {
-				log_printf(LOG_CRIT, DBG_OD_ENTRY, err_info);
-			} else {
-				log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANopenInit()", err);
-			}
-			std::exit(EXIT_FAILURE);
-		}
-	}
+    {
+        std::uint32_t err_info = 0;
+        CO_ReturnError_t err = CO_CANopenInit(
+                CO, nullptr, nullptr, OD, nullptr, 
+                NMT_CONTROL,
+                FIRST_HB_TIME,
+                SDO_SRV_TIMEOUT_TIME,
+                SDO_CLI_TIMEOUT_TIME,
+                false,
+                params.node_id,
+                &err_info);
+        if (err != CO_ERROR_NO && err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
+            if (err == CO_ERROR_OD_PARAMETERS) {
+                log_printf(LOG_CRIT, DBG_OD_ENTRY, err_info);
+            } else {
+                log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANopenInit()", err);
+            }
+            std::exit(EXIT_FAILURE);
+        }
+    }
 
-	CO_CANsetNormalMode(CO->CANmodule);
+    CO_CANsetNormalMode(CO->CANmodule);
 
-	CO_epoll_initCANopenMain(&ep_main, CO);
+    CO_epoll_initCANopenMain(&ep_main, CO);
     CO_epoll_initCANopenGtw(&ep_gtw, CO);
 
-	{
-		std::uint32_t err_info = 0;
-		CO_ReturnError_t err = CO_CANopenInitPDO(CO, CO->em, OD, 3, &err_info);
-		if (err != CO_ERROR_NO && err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
-			if (err == CO_ERROR_OD_PARAMETERS) {
-				log_printf(LOG_CRIT, DBG_OD_ENTRY, err_info);
-			} else {
-				log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANopenInit()", err);
-			}
-			std::exit(EXIT_FAILURE);
-		}
-	}
+    {
+        std::uint32_t err_info = 0;
+        CO_ReturnError_t err = CO_CANopenInitPDO(CO, CO->em, OD, params.node_id, &err_info);
+        if (err != CO_ERROR_NO && err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
+            if (err == CO_ERROR_OD_PARAMETERS) {
+                log_printf(LOG_CRIT, DBG_OD_ENTRY, err_info);
+            } else {
+                log_printf(LOG_CRIT, DBG_CAN_OPEN, "CO_CANopenInit()", err);
+            }
+            std::exit(EXIT_FAILURE);
+        }
+    }
 
     std::atomic<bool> should_die{false};
 
@@ -464,14 +509,11 @@ int main(int argc, char **argv) {
                 if (should_die.load()) {
                     break;
                 }
-                {
-                    std::lock_guard lock(co_global_mutex);
-
-                    CO_epoll_processRT(&ep_main, CO, false);
-                    CO_epoll_processMain(&ep_main, CO, true, &reset);
-                    CO_epoll_processGtw(&ep_gtw, CO, &ep_main);
-                    CO_epoll_processLast(&ep_main);
-                }
+                std::lock_guard lock(co_global_mutex);
+                CO_epoll_processRT(&ep_main, CO, false);
+                CO_epoll_processMain(&ep_main, CO, true, &reset);
+                CO_epoll_processGtw(&ep_gtw, CO, &ep_main);
+                CO_epoll_processLast(&ep_main);
             }
         });
 
@@ -497,12 +539,12 @@ int main(int argc, char **argv) {
     node->close_publisher_data_queue();
     publisher_thread.join();
 
-	CO_epoll_close(&ep_main);
+    CO_epoll_close(&ep_main);
     CO_epoll_closeGtw(&ep_gtw);
 
-	CO_CANsetConfigurationMode(&CANptr);
+    CO_CANsetConfigurationMode(&CANptr);
 
-	CO_delete(CO);
+    CO_delete(CO);
 
     rclcpp::shutdown();
 }
