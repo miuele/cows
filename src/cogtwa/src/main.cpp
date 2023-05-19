@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <thread>
 #include <charconv>
+#include <optional>
 #include <variant>
 
 #include <boost/thread/sync_queue.hpp>
@@ -14,10 +15,14 @@
 #include "cogtwa_interfaces/srv/sdo_read.hpp"
 #include "cogtwa_interfaces/srv/sdo_write.hpp"
 #include "cogtwa_interfaces/srv/configure_od_notify.hpp"
-#include "cogtwa_interfaces/srv/query_nmt_state.hpp"
+#include "cogtwa_interfaces/srv/nmt_state_get_by_node_id.hpp"
+#include "cogtwa_interfaces/srv/tpdo_use_unused.hpp"
+#include "cogtwa_interfaces/srv/rpdo_use_unused.hpp"
+#include "cogtwa_interfaces/srv/hb_consumer_set_by_node_id.hpp"
 #include "cogtwa_interfaces/msg/od_write_notify.hpp"
 #include "cogtwa_interfaces/msg/nmt_state.hpp"
 #include "cogtwa_interfaces/msg/hb_consumer_event.hpp"
+#include "cogtwa_interfaces/msg/od_sink.hpp"
 
 #include <syslog.h>
 
@@ -78,6 +83,57 @@ void log_printf(int priority, const char *format, ...) {
     }
 }
 
+
+std::optional<std::uint16_t> pdo_use_unused(OD_t *od, std::uint16_t index_from, std::uint16_t index_to, std::uint32_t cob_id) {
+    for (OD_entry_t *entry = OD_find(od, index_from)
+            ; entry < (od->list + od->size)
+            ; ++entry)
+    {
+        std::uint16_t index = OD_getIndex(entry);
+        if (index > index_to) {
+            break;
+        }
+        std::uint32_t value;
+        if (OD_get_u32(entry, 1, &value, false) == ODR_OK) {
+            if ((value & 0xBFFFFFFFU) == 0x80000000U) {
+                if (OD_set_u32(entry, 1, cob_id, false) == ODR_OK) {
+                    return index;
+                } else {
+                    break;
+                }
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint16_t> hb_consumer_set_by_node_id(OD_entry_t *entry, std::uint8_t node_id, std::uint16_t time_ms) {
+    std::uint32_t new_value = static_cast<std::uint32_t>(node_id) << 16 | time_ms;
+    std::uint8_t empty = 0;
+    for (std::uint8_t i = 1; i < entry->subEntriesCount; ++i) {
+        std::uint32_t value;
+        if (OD_get_u32(entry, i, &value, false) == ODR_OK) {
+            std::uint8_t id = (value >> 16) & 0xFFU;
+            if (id == node_id) {
+                if (OD_set_u32(entry, i, new_value, false) == ODR_OK) {
+                    return i;
+                } else {
+                    return std::nullopt;
+                }
+            } else if (empty == 0 && id == 0) {
+                empty = i;
+            }
+        }
+    }
+
+    // entry corresponding to node_id not found, write to unused entry
+    if (empty != 0 && OD_set_u32(entry, empty, new_value, false) == ODR_OK) {
+        return empty;
+    }
+
+    return std::nullopt;
+}
+
 std::mutex co_global_mutex;
 
 class COGtwa
@@ -93,11 +149,18 @@ private:
 
     using ConfigureODNotifyService = rclcpp::Service<cogtwa_interfaces::srv::ConfigureODNotify>;
 
-    using QueryNMTStateService = rclcpp::Service<cogtwa_interfaces::srv::QueryNMTState>;
+    using NMTStateGetByNodeIdService = rclcpp::Service<cogtwa_interfaces::srv::NMTStateGetByNodeId>;
+
+    using TPDOUseUnusedService = rclcpp::Service<cogtwa_interfaces::srv::TPDOUseUnused>;
+    using RPDOUseUnusedService = rclcpp::Service<cogtwa_interfaces::srv::RPDOUseUnused>;
+
+    using HBConsumerSetByNodeId = rclcpp::Service<cogtwa_interfaces::srv::HBConsumerSetByNodeId>;
 
     using ODWriteNotifyPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::ODWriteNotify>;
     using NMTStatePublisher = rclcpp::Publisher<cogtwa_interfaces::msg::NMTState>;
     using HBConsumerEventPublisher = rclcpp::Publisher<cogtwa_interfaces::msg::HBConsumerEvent>;
+
+    using ODSinkSubscriber = rclcpp::Subscription<cogtwa_interfaces::msg::ODSink>;
 
     struct ODWriteNotifyData {
         std::uint16_t index;
@@ -162,6 +225,90 @@ public:
                             uint8_t *flags_pdo = OD_getFlagsPDO(entry);
                             assert(flags_pdo);
                             OD_requestTPDO(flags_pdo, req->sub_index);
+                        }
+                    });
+
+        service_tpdo_use_unused_ =
+            this->create_service<cogtwa_interfaces::srv::TPDOUseUnused>(
+                    "tpdo_use_unused",
+                    [can_module = CO->CANmodule, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::TPDOUseUnused::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::TPDOUseUnused::Response> resp
+                      ) {
+
+                        ScopedODLock lock(can_module);
+
+                        auto index = pdo_use_unused(OD, 0x1800, 0x19FF, req->cob_id);
+                        if (index) {
+                            resp->index = index.value();
+                            resp->ok = true;
+                        } else {
+                            resp->index = 0;
+                            resp->ok = false;
+                        }
+                    });
+
+        service_rpdo_use_unused_ =
+            this->create_service<cogtwa_interfaces::srv::RPDOUseUnused>(
+                    "rpdo_use_unused",
+                    [can_module = CO->CANmodule, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::RPDOUseUnused::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::RPDOUseUnused::Response> resp
+                      ) {
+
+                        ScopedODLock lock(can_module);
+
+                        auto index = pdo_use_unused(OD, 0x1400, 0x15FF, req->cob_id);
+                        if (index) {
+                            resp->index = index.value();
+                            resp->ok = true;
+                        } else {
+                            resp->index = 0;
+                            resp->ok = false;
+                        }
+                    });
+
+        service_hb_consumer_set_by_node_id_ =
+            this->create_service<cogtwa_interfaces::srv::HBConsumerSetByNodeId>(
+                    "hb_consumer_set_by_node_id",
+                    [can_module = CO->CANmodule, OD](
+                        const std::shared_ptr<cogtwa_interfaces::srv::HBConsumerSetByNodeId::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::HBConsumerSetByNodeId::Response> resp
+                      ) {
+
+                        ScopedODLock lock(can_module);
+
+                        auto index = hb_consumer_set_by_node_id(OD_find(OD, 0x1016), req->node_id, req->heartbeat_time);
+                        if (index) {
+                            resp->index = index.value();
+                            resp->ok = true;
+                        } else {
+                            resp->index = 0;
+                            resp->ok = false;
+                        }
+                    });
+
+        od_sink_subscriber_ =
+            this->create_subscription<cogtwa_interfaces::msg::ODSink>(
+                    "od_sink", 10,
+                    [can_module = CO->CANmodule, OD](
+                        const std::shared_ptr<cogtwa_interfaces::msg::ODSink> msg
+                    ) {
+                        OD_entry_t *entry = OD_find(OD, msg->index);
+
+                        ScopedODLock lock(can_module);
+
+                        if (msg->data.size() > 0) {
+                            if (OD_set_value(entry, msg->sub_index, msg->data.data(), msg->data.size(), msg->no_notify)
+                                    != ODR_OK) {
+                                return;
+                            }
+                        }
+
+                        if (msg->request_tpdo) {
+                            uint8_t *flags_pdo = OD_getFlagsPDO(entry);
+                            assert(flags_pdo);
+                            OD_requestTPDO(flags_pdo, msg->sub_index);
                         }
                     });
 
@@ -248,12 +395,12 @@ public:
                         resp->topic_name = topic_name;
                     });
 
-        service_query_nmt_state_ =
-            this->create_service<cogtwa_interfaces::srv::QueryNMTState>(
-                    "query_nmt_state",
+        service_nmt_state_get_by_node_id_ =
+            this->create_service<cogtwa_interfaces::srv::NMTStateGetByNodeId>(
+                    "nmt_state_get_by_node_id",
                     [this, hbcons = CO->HBcons](
-                        const std::shared_ptr<cogtwa_interfaces::srv::QueryNMTState::Request> req,
-                        std::shared_ptr<cogtwa_interfaces::srv::QueryNMTState::Response> resp
+                        const std::shared_ptr<cogtwa_interfaces::srv::NMTStateGetByNodeId::Request> req,
+                        std::shared_ptr<cogtwa_interfaces::srv::NMTStateGetByNodeId::Response> resp
                         ) {
                         auto node_id = req->node_id;
 
@@ -361,7 +508,10 @@ private:
     std::shared_ptr<SDOReadService> service_sdo_read_;
     std::shared_ptr<SDOWriteService> service_sdo_write_;
     std::shared_ptr<ConfigureODNotifyService> service_configure_od_notify_;
-    std::shared_ptr<QueryNMTStateService> service_query_nmt_state_;
+    std::shared_ptr<NMTStateGetByNodeIdService> service_nmt_state_get_by_node_id_;
+    std::shared_ptr<TPDOUseUnusedService> service_tpdo_use_unused_;
+    std::shared_ptr<RPDOUseUnusedService> service_rpdo_use_unused_;
+    std::shared_ptr<HBConsumerSetByNodeId> service_hb_consumer_set_by_node_id_;
 
     boost::sync_queue<PublisherDataVariant> publisher_data_queue_;
 
@@ -369,6 +519,8 @@ private:
 
     std::shared_ptr<NMTStatePublisher> nmt_state_publisher_;
     std::shared_ptr<HBConsumerEventPublisher> hb_consumer_event_publisher_;
+
+    std::shared_ptr<ODSinkSubscriber> od_sink_subscriber_;
 
     ODExtension od_extension_;
     HBConsumer hb_consumer_;

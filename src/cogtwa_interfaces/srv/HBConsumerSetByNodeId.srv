@@ -1,0 +1,5 @@
+uint8 node_id
+uint16 heartbeat_time
+---
+bool ok
+uint16 index

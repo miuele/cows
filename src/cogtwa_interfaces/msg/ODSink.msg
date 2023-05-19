@@ -1,0 +1,5 @@
+uint16 index
+uint8 sub_index
+byte[] data
+bool no_notify false
+bool request_tpdo false

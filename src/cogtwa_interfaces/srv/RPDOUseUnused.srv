@@ -1,0 +1,4 @@
+uint32 cob_id
+---
+bool ok
+uint16 index
